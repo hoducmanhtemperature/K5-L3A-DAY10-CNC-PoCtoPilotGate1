@@ -1,12 +1,14 @@
 {
-  "team": "",
-  "members": [],
-  "incident": "",
-  "decision_v1": "",
-  "decision_v2": "",
+  "team": "K5-L3A-DAY10-CNC-PoCtoPilotGate1",
+  "members": [
+    "HoDucManh-2A202603609"
+  ],
+  "incident": "S5",
+  "decision_v1": "Tiếp tục",
+  "decision_v2": "Thu hẹp",
   "three_lines": {
-    "environment_assumption": "",
-    "reduce_or_prevent": "",
-    "measure_in_pilot": ""
+    "environment_assumption": "Thiết kế hiện tại đang giả định rằng mọi khoản hoàn tiền thủ công do nhân viên CSKH thực hiện qua tổng đài đều được ghi vào bảng sổ cái `world.ledger` tức thì trước khi khách hàng nhắn lại trên App/Zalo/Email, và phần nội dung yêu cầu cốt lõi của khách luôn nằm trong 800 ký tự đầu tiên trước dấu phân cách phụ lục `\\n---` của email.",
+    "reduce_or_prevent": "Cổng `write_gate` (đối chiếu trực tiếp `ledger_rows` để tính phần hoàn bù `full_entitlement - already_paid`), `pre_guard` (rút gọn văn bản bằng `Verdict.rewrite` và chặn trần LLM `1.500đ`) và cấu hình `business.pilot_scope` (cắt kho sỉ `HCM-B2B`) thực sự NGĂN HẲN tác hại hoàn trùng trên các giao dịch đã có trong sổ cái, ngăn hẳn việc nổ trần LLM `1.500đ/ticket` và ngăn hẳn lỗ cấu trúc ở kho `HCM-B2B` (đưa `wrongful_refund_vnd` từ `890.000đ` về `0đ`, `under_refund_vnd` về `0đ`, `llm_cost_max` từ `2.412đ` về `765đ` và `ROI` từ `-0.33` lên `3.15`); nhưng chỉ GIẢM khả năng đối với trường hợp CSKH hoàn tiền ngoài hệ thống chưa kịp nhập vào `ledger` hoặc khi một trong 4 kho lẻ (`HN`, `HCM`, `DN`, `CT`) đột ngột nhận nhiều đơn giá trị cao vượt hạn mức tự động.",
+    "measure_in_pilot": "Trong pilot thật tại 2 depot trước Bước đánh giá 2, cần đo lại: (1) chi phí thực tế mỗi ticket tách theo từng kho (`worst_warehouse_cost_per_ticket_vnd` gồm tiền token API thật + thời gian thực tế nhân viên CSKH duyệt 1 ca `escalated` và kiểm mẫu 1 ca có `decision_note`), (2) độ trễ đồng bộ giữa hệ thống CRM tổng đài của CSKH với sổ cái `ledger` để kiểm chứng không có hoàn trùng do race condition, và (3) tỷ lệ đơn hàng ở 4 kho lẻ bị vượt hạn mức tự động khi chính sách `REFUND-v4` hạ `auto_limit_vnd` xuống `100.000đ` vào ngày `2026-12-01`."
   }
 }

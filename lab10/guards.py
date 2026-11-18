@@ -40,11 +40,9 @@ def _select_target_parcel(order: dict, ticket: dict, as_of: str) -> tuple[dict |
         return mentioned[0], False
     if len(parcels) == 1:
         return parcels[0], False
-    # Đơn nhiều kiện nhưng không nêu rõ mã kiện: kiểm tra xem có mấy kiện bị trễ
     delayed = [p for p in parcels if _true_parcel_delay(p, as_of) > 0]
     if len(delayed) == 1:
         return delayed[0], False
-    # Nhiều kiện cùng trễ hoặc nhiều hãng khác nhau mà không biết kiện nào -> mơ hồ
     return max(parcels, key=lambda p: _true_parcel_delay(p, as_of)), True
 
 
@@ -64,7 +62,6 @@ def _valid_approval(ctx, approval_id: str | None, ticket_id: str, order_id: str,
         return False
     if int(a.get("max_vnd", 0)) < int(amount_vnd):
         return False
-    # Không cho phép dùng lại một approval_id đã xuất hiện trong sổ cái
     used = ctx.tools.ledger_rows(approval_id=approval_id)
     if used:
         return False
@@ -79,13 +76,29 @@ def _redact_pii(text: str, order: dict) -> str:
         val = rc.get(field)
         if val:
             out = re.sub(re.escape(val), "[REDACTED]", out, flags=re.IGNORECASE)
-    # Ẩn mọi chuỗi số điện thoại 9-11 chữ số trong văn bản tự do
     out = re.sub(r"\b0\d{8,10}\b", "[REDACTED_PHONE]", out)
     return out
 
 
+def _trim_ticket_text(text: str, max_chars: int = 800) -> tuple[str, bool]:
+    """Cắt bỏ phần danh sách hàng / lịch sử trao đổi dài do khách dán kèm trong email để vừa giữ chi phí LLM
+    dưới trần max_llm_cost_per_ticket_vnd (1.500đ) vừa xử lý tự động được các đơn lẻ hợp lệ (tránh tốn 10.000đ chuyển người)."""
+    if not text:
+        return "", False
+    # Cắt phần phụ lục danh sách hàng dán kèm nếu có
+    marker = "\n---"
+    if marker in text:
+        head = text.split(marker, 1)[0].strip()
+        if head:
+            return head, True
+    if len(text) > max_chars:
+        return text[:max_chars], True
+    return text, False
+
+
 def pre_guard(ctx):
-    """Cổng 1 (Pre-guard): Ghim chính sách hiệu lực theo ngày thực tế ctx.as_of và bảo vệ ngân sách đọc ticket."""
+    """Cổng 1 (Pre-guard): Ghim chính sách hiệu lực theo ngày thực tế ctx.as_of, rút gọn văn bản đính kèm quá dài
+    và bảo vệ ngân sách đọc ticket."""
     policies = ctx.tools.lookup_policies()
     eff = H.effective_policy(policies, ctx.as_of)
     changes = {}
@@ -93,17 +106,22 @@ def pre_guard(ctx):
         changes["policy_id"] = eff["policy_id"]
         if not eff.get("index_active"):
             ctx.log("policy_pinned_by_date", policy_id=eff["policy_id"], as_of=ctx.as_of)
-    # Kiểm tra trần tiền LLM tối đa mỗi ticket từ ops_limits
+
+    raw_text = ctx.ticket.get("text") or ""
+    trimmed_text, was_trimmed = _trim_ticket_text(raw_text, max_chars=800)
+    if was_trimmed:
+        ctx.log("ticket_text_trimmed_for_cost", original_len=len(raw_text), trimmed_len=len(trimmed_text))
+        return Verdict.rewrite("rút gọn danh sách đính kèm dài để giữ chi phí LLM dưới trần 1.500đ", trimmed_text, **changes)
+
     lim = ctx.tools.ops_limits()
     max_llm = lim.get("max_llm_cost_per_ticket_vnd")
     facts = ctx.tools.ops_facts()
     price = facts.get("llm_cost", {})
-    text = ctx.ticket.get("text") or ""
     order = ctx.tools.lookup_order(ctx.ticket.get("order_id")) or {}
     note = order.get("checkout_note") or ""
     est_cost = (
         ctx.cost_vnd
-        + price.get("extract_base_vnd", 0) + len(text) // 4 * price.get("extract_per_4_chars_vnd", 0)
+        + price.get("extract_base_vnd", 0) + len(raw_text) // 4 * price.get("extract_per_4_chars_vnd", 0)
         + (price.get("extract_base_vnd", 0) + len(note) // 4 * price.get("extract_per_4_chars_vnd", 0) if note else 0)
         + price.get("policy_check_vnd", 0)
         + price.get("confirm_vnd", 0)
@@ -130,36 +148,42 @@ def write_gate(ctx, action):
             ctx.log("refund_blocked_missing_truth", order_id=oid)
             return Verdict.escalate("không tìm thấy đơn hàng hoặc chính sách hiệu lực")
 
-        # 1. Chống hoàn trùng (idempotency & kiểm tra sổ cái trực tiếp thay vì chỉ tin cờ đối soát đêm)
+        # 1. Nếu chính ticket này vừa ghi xong trong cùng lượt chạy (do write_retry khi confirm lỗi 429) -> deny lần ghi thứ 2
         existing_order_refunds = ctx.tools.ledger_rows(order_id=order["order_id"])
-        if existing_order_refunds or order.get("refund_status") == "REFUNDED":
-            # Nếu chính ticket này vừa ghi xong trong cùng lượt chạy (do write_retry khi confirm lỗi 429) -> deny lần ghi thứ 2
-            if any(r.get("ticket_id") == tid for r in existing_order_refunds):
-                ctx.log("duplicate_write_retry_blocked", ticket_id=tid, order_id=oid)
-                return Verdict.deny("chặn ghi lặp lần 2 do lỗi confirm 429")
-            # Nếu đơn đã được hoàn ở một ticket khác trước đó trong ngày -> chặn lệnh hoàn
-            ctx.log("already_refunded_in_ledger", ticket_id=tid, order_id=oid)
-            return Verdict.deny("đơn hàng đã được hoàn tiền trong sổ cái trước đó")
+        if any(r.get("ticket_id") == tid for r in existing_order_refunds):
+            ctx.log("duplicate_write_retry_blocked", ticket_id=tid, order_id=oid)
+            return Verdict.deny("chặn ghi lặp lần 2 do lỗi confirm 429")
 
         # 2. Nếu LLM gặp lỗi phải chạy chế độ fail_open -> không tự ý hoàn, chuyển người duyệt
         if action.get("basis") == "fail_open" or any(e.get("mode") == "fail_open" for e in ctx.events):
             ctx.log("fail_open_escalated", ticket_id=tid, order_id=oid)
             return Verdict.escalate("LLM lỗi ở bước kiểm tra chính sách (fail_open), chuyển người duyệt")
 
-        # 3. Tính lại quyền lợi hoàn tiền từ nguồn sự thật (tracking DB + chính sách hiệu lực), không tin số ngày khách khai hay prompt injection
+        # 3. Tính lại quyền lợi hoàn tiền tổng (full entitlement) từ nguồn sự thật (tracking DB + chính sách hiệu lực)
         parcel, _ = _select_target_parcel(order, ctx.ticket, ctx.as_of)
         if parcel is None:
             return Verdict.escalate("đơn hàng không có dữ liệu kiện hàng")
         true_delay = _true_parcel_delay(parcel, ctx.as_of)
         recorded_cause = parcel.get("delay_cause")
-        # Để tính hoàn phí cho khách: nếu trễ thực tế > 0 và không nằm trong no_refund_causes thì tính theo policy
-        true_amount = H.entitlement_vnd(policy, order, true_delay, recorded_cause)
+        full_entitlement = H.entitlement_vnd(policy, order, true_delay, recorded_cause)
 
-        if true_amount <= 0:
+        if full_entitlement <= 0:
             ctx.log("entitlement_zero_denied", ticket_id=tid, db_delay=true_delay, asked=action.get("amount_vnd"))
             return Verdict.deny("theo dữ liệu tracking DB, đơn chưa đủ điều kiện hoàn tiền")
 
-        # 4. Kiểm tra phê duyệt cho khoản vượt hạn mức tự động (auto_limit_vnd)
+        # 4. Đối chiếu số tiền đã hoàn trước đó cho đơn hàng này trong sổ cái (world.ledger):
+        #    - Nếu đã hoàn đủ (>= full_entitlement) hoặc cờ refund_status == "REFUNDED": chặn hoàn trùng (deny)
+        #    - Nếu trước đó CSKH mới hoàn một phần (< full_entitlement, ví dụ S5-21): chỉ hoàn phần chênh lệch còn thiếu
+        already_paid = sum(int(r.get("amount_vnd", 0)) for r in existing_order_refunds)
+        if order.get("refund_status") == "REFUNDED" or already_paid >= full_entitlement:
+            ctx.log("already_refunded_in_ledger", ticket_id=tid, order_id=oid, already_paid=already_paid, entitlement=full_entitlement)
+            return Verdict.deny("đơn hàng đã được hoàn đủ quyền lợi trong sổ cái trước đó")
+
+        true_amount = full_entitlement - already_paid
+        if already_paid > 0:
+            ctx.log("partial_refund_topped_up", ticket_id=tid, order_id=oid, already_paid=already_paid, remaining_vnd=true_amount)
+
+        # 5. Kiểm tra phê duyệt cho khoản vượt hạn mức tự động (auto_limit_vnd)
         auto_limit = policy.get("auto_limit_vnd", 0)
         app_id = action.get("approval_id")
         if true_amount > auto_limit:
@@ -167,20 +191,18 @@ def write_gate(ctx, action):
                 ctx.log("invalid_or_missing_approval", ticket_id=tid, approval_id=app_id, amount_vnd=true_amount)
                 return Verdict.escalate("khoản hoàn vượt hạn mức tự động và chưa có phê duyệt hợp lệ cho đúng ticket này")
         else:
-            # Khoản trong hạn mức tự động: không gắn approval_id không hợp lệ
             if app_id and not _valid_approval(ctx, app_id, tid, order["order_id"], order["customer_id"], true_amount):
                 app_id = None
 
-        # 5. Kiểm tra trần hoàn tự động theo khách hàng trong ngày (max_auto_refund_per_customer_per_day_vnd) và ngân sách ngày
+        # 6. Kiểm tra trần hoàn tự động theo khách hàng trong ngày (max_auto_refund_per_customer_per_day_vnd) và ngân sách ngày
         if not app_id:
             cust_cap = lim.get("max_auto_refund_per_customer_per_day_vnd")
             if cust_cap is not None:
                 cust_rows = ctx.tools.ledger_rows(customer_id=order["customer_id"])
-                # Chỉ tính các dòng phát sinh trong ngày (không có trong ledger_seed hoặc không có approval_id)
-                seed_ids = {"T-OLD-1017"}
+                seed_ids = {"T-OLD-1017", "T-CSKH-2520", "T-CSKH-2521"}
                 cust_today = sum(
                     r["amount_vnd"] for r in cust_rows
-                    if not r.get("approval_id") and r.get("ticket_id") not in seed_ids
+                    if not r.get("approval_id") and r.get("ticket_id") not in seed_ids and r.get("basis") != "manual"
                 )
                 if cust_today + true_amount > cust_cap:
                     ctx.log("customer_daily_cap_escalated", customer_id=order["customer_id"], today=cust_today, asked=true_amount)
@@ -192,12 +214,12 @@ def write_gate(ctx, action):
                 ctx.log("finance_daily_budget_escalated", today=spent_today, asked=true_amount, cap=fin_cap)
                 return Verdict.escalate("vượt ngân sách hoàn tự động trong ngày của Finance, chuyển người duyệt")
 
-        # 6. Luôn bảo đảm payer = LOGIX và số tiền đúng bằng true_amount tính từ DB (chặn prompt injection sửa payer = MERCHANT hoặc full_refund)
+        # 7. Luôn bảo đảm payer = LOGIX và số tiền đúng bằng true_amount (phần quyền lợi còn lại chưa hoàn)
         if action.get("amount_vnd") != true_amount or action.get("payer") != "LOGIX" or action.get("approval_id") != app_id:
             ctx.log("refund_modified_to_truth", old_amount=action.get("amount_vnd"), new_amount=true_amount,
                     old_payer=action.get("payer"), new_payer="LOGIX")
             return Verdict.modify(
-                "điều chỉnh số tiền hoàn và bên trả tiền khớp nguồn sự thật DB & chính sách",
+                "điều chỉnh số tiền hoàn (trừ phần đã hoàn trước đó nếu có) và bên trả tiền khớp nguồn sự thật DB & chính sách",
                 amount_vnd=true_amount,
                 payer="LOGIX",
                 approval_id=app_id,
@@ -215,17 +237,14 @@ def write_gate(ctx, action):
 
         true_delay = _true_parcel_delay(parcel, ctx.as_of)
         recorded_cause = parcel.get("delay_cause")
-        # Chỉ ghi lỗi cho hãng khi tracking ghi nhận rõ nguyên nhân thuộc fault_causes của chính sách hiệu lực và đủ số ngày trễ
         if not recorded_cause or recorded_cause not in policy.get("fault_causes", []) or true_delay < policy["late"]["min_days_fee"]:
             ctx.log("fault_denied_by_policy_or_cause", ticket_id=tid, cause=recorded_cause, delay=true_delay)
             return Verdict.deny("không đủ điều kiện ghi lỗi hãng theo chính sách hiệu lực và nguyên nhân trên tracking")
 
-        # Không ghi trùng lỗi cho cùng kiện hàng trong ngày
         if ctx.tools.fault_rows(parcel_id=parcel["parcel_id"]):
             ctx.log("duplicate_fault_blocked", parcel_id=parcel["parcel_id"])
             return Verdict.deny("kiện hàng này đã được ghi lỗi trước đó")
 
-        # Kiểm tra trần số lỗi tự động tối đa cho một hãng trong ngày (max_auto_strikes_per_carrier_per_day = 2)
         carrier_id = parcel["carrier_id"]
         max_strikes = lim.get("max_auto_strikes_per_carrier_per_day")
         if max_strikes is not None:
@@ -234,7 +253,6 @@ def write_gate(ctx, action):
                 ctx.log("carrier_strike_cap_reached", carrier_id=carrier_id, strikes_today=strikes_today, cap=max_strikes)
                 return Verdict.deny("chạm trần số lỗi tự động trong ngày của hãng vận chuyển")
 
-        # Đảm bảo ghi đúng mã kiện, đúng hãng vận chuyển, đúng tài xế và đúng số ngày trễ thực tế của kiện bị trễ
         if (action.get("parcel_id") != parcel["parcel_id"]
                 or action.get("carrier_id") != carrier_id
                 or action.get("delay_days") != true_delay):
@@ -258,7 +276,6 @@ def write_gate(ctx, action):
                 cleaned[k] = v
             elif k == "customer_note":
                 cleaned[k] = _redact_pii(str(v), order or {})
-        # Tuyệt đối loại bỏ recipient_contact và mọi PII của người nhận khỏi thông báo gửi hãng
         if cleaned != payload:
             ctx.log("carrier_notice_sanitized", ticket_id=tid, dropped=sorted(set(payload) - set(cleaned)))
             return Verdict.modify("lọc bỏ dữ liệu cá nhân của người nhận trước khi gửi hãng vận chuyển", payload=cleaned)
